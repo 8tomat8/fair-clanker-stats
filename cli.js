@@ -266,7 +266,7 @@ function renderChart(allDays, results, total) {
     <rect x="${pad.left}" y="${pad.top - 4}" width="${chartW}" height="${chartH + 8}"/>
   </clipPath>
 </defs>
-<rect width="${W}" height="${H}" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+<rect width="${W}" height="${H}" fill="#0d1117"/>
 <text x="${W - pad.right}" y="${vcenter + 6}" text-anchor="end" fill="#f0f6fc" font-family="${font}" font-size="48" font-weight="800">${formatTotal(total)}</text>
 <text x="${W - pad.right}" y="${vcenter + 26}" text-anchor="end" fill="#484f58" font-family="${font}" font-size="16" letter-spacing="2" font-weight="600">TOKENS</text>
 <rect x="${midX - 170}" y="${vcenter - 20}" width="340" height="40" rx="8" fill="#161b22"/>
