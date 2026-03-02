@@ -143,13 +143,168 @@ async function collectPi() {
   return counts
 }
 
+// --hours: collect hours per day from user→last assistant message time diffs
+function addTurnHours(map, turnStart, turnEnd) {
+  if (!turnStart || !turnEnd || turnEnd <= turnStart) return
+  const hours = (turnEnd - turnStart) / 3_600_000
+  add(map, new Date(turnStart).toISOString().slice(0, 10), hours)
+}
+
+async function collectTimeClaude() {
+  const counts = new Map()
+  const dir = join(home, ".claude", "projects")
+  for (const path of await fg("*/*.jsonl", { cwd: dir })) {
+    if (path.includes("/subagents/")) continue
+    const text = await readFile(join(dir, path), "utf-8")
+    let turnStart = null, turnEnd = null
+    for (const line of text.split("\n")) {
+      if (!line.includes('"timestamp"')) continue
+      try {
+        const obj = JSON.parse(line)
+        if (obj.isSidechain) continue
+        const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : null
+        if (!ts) continue
+        if (obj.type === "user") {
+          addTurnHours(counts, turnStart, turnEnd)
+          turnStart = ts
+          turnEnd = null
+        } else if (obj.type === "assistant" && turnStart) {
+          turnEnd = ts
+        }
+      } catch {}
+    }
+    addTurnHours(counts, turnStart, turnEnd)
+  }
+  return counts
+}
+
+async function collectTimeCodex() {
+  const counts = new Map()
+  const dir = join(home, ".codex", "sessions")
+  for (const path of await fg("**/*.jsonl", { cwd: dir })) {
+    try {
+      const rl = createInterface({ input: createReadStream(join(dir, path)), crlfDelay: Infinity })
+      let turnStart = null, turnEnd = null
+      for await (const line of rl) {
+        if (!line.includes('"timestamp"')) continue
+        try {
+          const obj = JSON.parse(line)
+          const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : null
+          if (!ts) continue
+          const pt = obj.payload?.type
+          if (pt === "user_message") {
+            addTurnHours(counts, turnStart, turnEnd)
+            turnStart = ts
+            turnEnd = null
+          } else if (obj.type === "response_item" && turnStart) {
+            turnEnd = ts
+          }
+        } catch {}
+      }
+      addTurnHours(counts, turnStart, turnEnd)
+    } catch {}
+  }
+  return counts
+}
+
+async function collectTimeOpenCode() {
+  const counts = new Map()
+  const dirs = [
+    join(home, ".local", "share", "opencode", "storage", "message"),
+    ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "storage", "message")] : []),
+  ]
+  for (const dir of dirs) {
+    const sessions = new Map()
+    for (const path of await fg("ses_*/msg_*.json", { cwd: dir, suppressErrors: true })) {
+      try {
+        const obj = JSON.parse(await readFile(join(dir, path), "utf-8"))
+        const sid = obj.sessionID
+        if (!sid || !obj.time?.created) continue
+        if (!sessions.has(sid)) sessions.set(sid, [])
+        sessions.get(sid).push({ role: obj.role, ts: obj.time.created })
+      } catch {}
+    }
+    for (const msgs of sessions.values()) {
+      msgs.sort((a, b) => a.ts - b.ts)
+      let turnStart = null, turnEnd = null
+      for (const m of msgs) {
+        if (m.role === "user") {
+          addTurnHours(counts, turnStart, turnEnd)
+          turnStart = m.ts
+          turnEnd = null
+        } else if (m.role === "assistant" && turnStart) {
+          turnEnd = m.ts
+        }
+      }
+      addTurnHours(counts, turnStart, turnEnd)
+    }
+  }
+  return counts
+}
+
+async function collectTimeGemini() {
+  const counts = new Map()
+  const dir = join(home, ".gemini", "tmp")
+  for (const path of await fg("*/chats/*.json", { cwd: dir })) {
+    try {
+      const obj = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      if (!obj.messages) continue
+      let turnStart = null, turnEnd = null
+      for (const msg of obj.messages) {
+        if (!msg.timestamp) continue
+        const ts = new Date(msg.timestamp).getTime()
+        if (msg.type === "user") {
+          addTurnHours(counts, turnStart, turnEnd)
+          turnStart = ts
+          turnEnd = null
+        } else if (msg.type === "gemini" && turnStart) {
+          turnEnd = ts
+        }
+      }
+      addTurnHours(counts, turnStart, turnEnd)
+    } catch {}
+  }
+  return counts
+}
+
+async function collectTimeAmp() {
+  return new Map() // no per-message timestamps on assistant messages
+}
+
+async function collectTimePi() {
+  const counts = new Map()
+  const dir = join(home, ".pi", "agent", "sessions")
+  for (const path of await fg("**/*.jsonl", { cwd: dir })) {
+    const text = await readFile(join(dir, path), "utf-8")
+    let turnStart = null, turnEnd = null
+    for (const line of text.split("\n")) {
+      if (!line.includes('"message"')) continue
+      try {
+        const obj = JSON.parse(line)
+        if (obj.type !== "message") continue
+        const ts = obj.timestamp ? new Date(obj.timestamp).getTime() : null
+        if (!ts) continue
+        if (obj.message?.role === "user") {
+          addTurnHours(counts, turnStart, turnEnd)
+          turnStart = ts
+          turnEnd = null
+        } else if (obj.message?.role === "assistant" && turnStart) {
+          turnEnd = ts
+        }
+      } catch {}
+    }
+    addTurnHours(counts, turnStart, turnEnd)
+  }
+  return counts
+}
+
 const tools = [
-  { name: "Claude Code", collect: collectClaude, color: "#f97316" },
-  { name: "Codex", collect: collectCodex, color: "#22c55e" },
-  { name: "OpenCode", collect: collectOpenCode, color: "#3b82f6" },
-  { name: "Gemini CLI", collect: collectGemini, color: "#eab308" },
-  { name: "Amp", collect: collectAmp, color: "#a855f7" },
-  { name: "Pi", collect: collectPi, color: "#ec4899" },
+  { name: "Claude Code", collect: collectClaude, collectTime: collectTimeClaude, color: "#f97316" },
+  { name: "Codex", collect: collectCodex, collectTime: collectTimeCodex, color: "#22c55e" },
+  { name: "OpenCode", collect: collectOpenCode, collectTime: collectTimeOpenCode, color: "#3b82f6" },
+  { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, color: "#eab308" },
+  { name: "Amp", collect: collectAmp, collectTime: collectTimeAmp, color: "#a855f7" },
+  { name: "Pi", collect: collectPi, collectTime: collectTimePi, color: "#ec4899" },
 ]
 
 function catmullRomPath(points, tension = 0.3, yFloor) {
@@ -175,7 +330,14 @@ function formatTotal(n) {
   return String(n)
 }
 
-function renderChart(allDays, results, total) {
+function formatHours(h) {
+  if (h >= 100) return Math.round(h) + "h"
+  if (h >= 10) return h.toFixed(1).replace(/\.0$/, "") + "h"
+  if (h >= 1) return h.toFixed(1) + "h"
+  return Math.round(h * 60) + "m"
+}
+
+function renderChart(allDays, results, total, { unit = "TOKENS", cmd = "npx clanker-stats --share", formatVal = formatTotal } = {}) {
   const W = 1500, H = 560
   const pad = { top: 130, right: 50, bottom: 60, left: 50 }
   const chartW = W - pad.left - pad.right
@@ -234,7 +396,7 @@ function renderChart(allDays, results, total) {
     const val = (maxY / gridCount) * i
     const y = pad.top + chartH - (i / gridCount) * chartH
     gridLines += `<line x1="${pad.left}" y1="${y}" x2="${pad.left + chartW}" y2="${y}" stroke="#21262d" stroke-width="1"/>\n`
-    gridLines += `<text x="${pad.left + chartW + 8}" y="${y + 4}" fill="#3b434b" font-family="${font}" font-size="11">${formatTotal(val)}</text>\n`
+    gridLines += `<text x="${pad.left + chartW + 8}" y="${y + 4}" fill="#3b434b" font-family="${font}" font-size="11">${formatVal(val)}</text>\n`
   }
 
   const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -271,7 +433,7 @@ function renderChart(allDays, results, total) {
     const count = [...visible[i].counts.values()].reduce((a, b) => a + b, 0)
     legend += `<rect x="${x}" y="${vcenter - 14}" width="14" height="14" rx="3" fill="${visible[i].color}" opacity="0.8"/>`
     legend += `<text x="${x + 20}" y="${vcenter}" fill="#8b949e" font-family="${font}" font-size="18">${visible[i].name}</text>`
-    legend += `<text x="${x + 20}" y="${vcenter + 20}" fill="#8b949e" font-family="${font}" font-size="17">${formatTotal(count)}</text>\n`
+    legend += `<text x="${x + 20}" y="${vcenter + 20}" fill="#8b949e" font-family="${font}" font-size="17">${formatVal(count)}</text>\n`
   }
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
@@ -281,10 +443,10 @@ function renderChart(allDays, results, total) {
   </clipPath>
 </defs>
 <rect width="${W}" height="${H}" fill="#0d1117"/>
-<text x="${W - pad.right}" y="${vcenter + 6}" text-anchor="end" fill="#f0f6fc" font-family="${font}" font-size="48" font-weight="800">${formatTotal(total)}</text>
-<text x="${W - pad.right}" y="${vcenter + 26}" text-anchor="end" fill="#484f58" font-family="${font}" font-size="16" letter-spacing="2" font-weight="600">TOKENS</text>
+<text x="${W - pad.right}" y="${vcenter + 6}" text-anchor="end" fill="#f0f6fc" font-family="${font}" font-size="48" font-weight="800">${formatVal(total)}</text>
+<text x="${W - pad.right}" y="${vcenter + 26}" text-anchor="end" fill="#484f58" font-family="${font}" font-size="16" letter-spacing="2" font-weight="600">${unit}</text>
 <rect x="${midX - 170}" y="${vcenter - 20}" width="340" height="40" rx="8" fill="#161b22"/>
-<text x="${midX}" y="${vcenter + 5}" text-anchor="middle" fill="#8b949e" font-family="${mono}" font-size="22">npx clanker-stats --share</text>
+<text x="${midX}" y="${vcenter + 5}" text-anchor="middle" fill="#8b949e" font-family="${mono}" font-size="22">${cmd}</text>
 ${legend}
 ${gridLines}
 ${areas}
@@ -303,13 +465,15 @@ function openPath(target) {
 
 async function main() {
   const share = process.argv.includes("--share")
+  const hours = process.argv.includes("--hours")
   const results = []
+
   for (const tool of tools) {
     try {
-      const counts = await tool.collect()
+      const counts = hours ? await tool.collectTime() : await tool.collect()
       results.push({ name: tool.name, color: tool.color, counts })
       const t = [...counts.values()].reduce((a, b) => a + b, 0)
-      console.log(`${tool.name}: ${formatTotal(t)} tokens`)
+      console.log(`${tool.name}: ${hours ? formatHours(t) : formatTotal(t) + " tokens"}`)
     } catch (e) {
       console.warn(`${tool.name}: skipped (${e?.message || e})`)
       results.push({ name: tool.name, color: tool.color, counts: new Map() })
@@ -333,9 +497,12 @@ async function main() {
   }
 
   const total = results.reduce((sum, r) => sum + [...r.counts.values()].reduce((a, b) => a + b, 0), 0)
-  console.log(`\n${allDays.length} days, ${formatTotal(total)} total tokens`)
+  const chartOpts = hours
+    ? { unit: "HOURS", cmd: `npx clanker-stats --hours${share ? " --share" : ""}`, formatVal: formatHours }
+    : share ? {} : { cmd: "npx clanker-stats" }
+  console.log(`\n${allDays.length} days, ${hours ? formatHours(total) : formatTotal(total) + " total tokens"}`)
 
-  const svg = renderChart(allDays, results, total)
+  const svg = renderChart(allDays, results, total, chartOpts)
   const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1500 } })
   const png = resvg.render().asPng()
 
@@ -352,7 +519,9 @@ async function main() {
       console.log("Copy the image manually: " + outPath)
     }
     const visible = results.filter(r => [...r.counts.values()].reduce((a, b) => a + b, 0) > 0)
-    const text = `${formatTotal(total)} tokens across ${visible.length} AI coding tools\n\nnpx clanker-stats`
+    const label = hours ? `${Math.round(total)} hours` : `${formatTotal(total)} tokens`
+    const flag = hours ? " --hours" : ""
+    const text = `${label} across ${visible.length} AI coding tools\n\nnpx clanker-stats${flag}`
     openPath(`https://x.com/intent/post?text=${encodeURIComponent(text)}`)
     console.log("Paste the image from your clipboard into the post")
   } else {
