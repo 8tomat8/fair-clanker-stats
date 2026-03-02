@@ -207,6 +207,49 @@ async function collectTimeCodex() {
   return counts
 }
 
+async function collectVibe() {
+  const counts = new Map()
+  const dir = join(home, ".vibe", "logs", "session")
+  for (const path of await fg("*/meta.json", { cwd: dir })) {
+    try {
+      const meta = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      const stats = meta.stats
+      if (!stats) continue
+      const tokens = stats.session_total_llm_tokens || 
+        ((stats.session_prompt_tokens || 0) + (stats.session_completion_tokens || 0))
+      if (tokens > 0 && meta.start_time) {
+        const date = meta.start_time.slice(0, 10)
+        add(counts, date, tokens)
+      }
+    } catch {}
+  }
+  return counts
+}
+
+async function collectTimeVibe() {
+  const counts = new Map()
+  const dir = join(home, ".vibe", "logs", "session")
+  
+  // Use session start_time and end_time from meta.json files
+  for (const path of await fg("*/meta.json", { cwd: dir })) {
+    try {
+      const meta = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      if (!meta.start_time || !meta.end_time) continue
+      
+      const startTime = new Date(meta.start_time).getTime()
+      const endTime = new Date(meta.end_time).getTime()
+      
+      if (startTime && endTime && endTime > startTime) {
+        const hours = (endTime - startTime) / 3_600_000
+        const date = meta.start_time.slice(0, 10)
+        add(counts, date, hours)
+      }
+    } catch {}
+  }
+  
+  return counts
+}
+
 async function collectTimeOpenCode() {
   const counts = new Map()
   const dirs = [
@@ -305,6 +348,7 @@ const tools = [
   { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, color: "#eab308" },
   { name: "Amp", collect: collectAmp, collectTime: collectTimeAmp, color: "#a855f7" },
   { name: "Pi", collect: collectPi, collectTime: collectTimePi, color: "#ec4899" },
+  { name: "Mistral Vibe", collect: collectVibe, collectTime: collectTimeVibe, color: "#6366f1" },
 ]
 
 function catmullRomPath(points, tension = 0.3, yFloor) {
