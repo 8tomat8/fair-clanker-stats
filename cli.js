@@ -227,7 +227,27 @@ async function collectVibe() {
 }
 
 async function collectTimeVibe() {
-  return new Map() // no per-message timestamps on assistant messages
+  const counts = new Map()
+  const dir = join(home, ".vibe", "logs", "session")
+  
+  // Use session start_time and end_time from meta.json files
+  for (const path of await fg("*/meta.json", { cwd: dir })) {
+    try {
+      const meta = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      if (!meta.start_time || !meta.end_time) continue
+      
+      const startTime = new Date(meta.start_time).getTime()
+      const endTime = new Date(meta.end_time).getTime()
+      
+      if (startTime && endTime && endTime > startTime) {
+        const hours = (endTime - startTime) / 3_600_000
+        const date = meta.start_time.slice(0, 10)
+        add(counts, date, hours)
+      }
+    } catch {}
+  }
+  
+  return counts
 }
 
 async function collectTimeOpenCode() {
