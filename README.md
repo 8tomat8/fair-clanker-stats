@@ -1,24 +1,32 @@
-# clanker-stats
+# fair-clanker-stats
+
+Fork of [clanker-stats](https://github.com/dnakov/clanker-stats) with SQLite support for OpenCode v1.2.0+.
 
 See how many tokens you've burned across AI coding tools.
-
-![chart](https://github.com/dnakov/clanker-stats/raw/main/chart.png)
 
 ## Usage
 
 ```
-npx clanker-stats
+npx fair-clanker-stats
 ```
 
 Generates `chart.png` in the current directory and opens it.
 
-### Share on X
+### Options
 
-```
-npx clanker-stats --share
+```bash
+npx fair-clanker-stats --hours    # show hours per day instead of tokens
+npx fair-clanker-stats --share    # copy chart to clipboard + open X
 ```
 
-Copies the chart to your clipboard, opens X with a pre-filled post. Just paste and post.
+### Run from source
+
+```bash
+git clone https://github.com/8tomat8/fair-clanker-stats.git
+cd fair-clanker-stats
+npm install
+node cli.js
+```
 
 ## Supported tools
 
@@ -26,7 +34,7 @@ Copies the chart to your clipboard, opens X with a pre-filled post. Just paste a
 |------|------------|
 | Claude Code | `~/.claude/projects/` |
 | Codex | `~/.codex/sessions/` |
-| OpenCode | `~/.local/share/opencode/` |
+| OpenCode | `~/.local/share/opencode/` (SQLite + JSON fallback) |
 | Gemini CLI | `~/.gemini/tmp/` |
 | Amp | `~/.local/share/amp/threads/` |
 | Pi | `~/.pi/agent/sessions/` |

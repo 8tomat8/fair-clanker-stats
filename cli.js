@@ -479,7 +479,7 @@ function pickFont(candidates) {
   return candidates[candidates.length - 1]
 }
 
-function renderChart(allDays, results, total, { unit = "TOKENS", cmd = "npx clanker-stats --share", formatVal = formatTotal } = {}) {
+function renderChart(allDays, results, total, { unit = "TOKENS", cmd = "npx fair-clanker-stats --share", formatVal = formatTotal } = {}) {
   const W = 1500, H = 560
   const pad = { top: 130, right: 50, bottom: 60, left: 50 }
   const chartW = W - pad.left - pad.right
@@ -640,8 +640,8 @@ async function main() {
 
   const total = results.reduce((sum, r) => sum + [...r.counts.values()].reduce((a, b) => a + b, 0), 0)
   const chartOpts = hours
-    ? { unit: "HOURS", cmd: `npx clanker-stats --hours${share ? " --share" : ""}`, formatVal: formatHours }
-    : share ? {} : { cmd: "npx clanker-stats" }
+    ? { unit: "HOURS", cmd: `npx fair-clanker-stats --hours${share ? " --share" : ""}`, formatVal: formatHours }
+    : share ? {} : { cmd: "npx fair-clanker-stats" }
   console.log(`\n${allDays.length} days, ${hours ? formatHours(total) : formatTotal(total) + " total tokens"}`)
 
   const svg = renderChart(allDays, results, total, chartOpts)
@@ -663,7 +663,7 @@ async function main() {
     const visible = results.filter(r => [...r.counts.values()].reduce((a, b) => a + b, 0) > 0)
     const label = hours ? `${Math.round(total)} hours` : `${formatTotal(total)} tokens`
     const flag = hours ? " --hours" : ""
-    const text = `${label} across ${visible.length} AI coding tools\n\nnpx clanker-stats${flag}`
+    const text = `${label} across ${visible.length} AI coding tools\n\nnpx fair-clanker-stats${flag}`
     openPath(`https://x.com/intent/post?text=${encodeURIComponent(text)}`)
     console.log("Paste the image from your clipboard into the post")
   } else {

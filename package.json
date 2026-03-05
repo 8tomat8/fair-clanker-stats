@@ -1,10 +1,10 @@
 {
-  "name": "clanker-stats",
+  "name": "fair-clanker-stats",
   "version": "0.5.0",
-  "description": "See how many tokens you've burned across AI coding tools",
+  "description": "See how many tokens you've burned across AI coding tools (with SQLite support for OpenCode)",
   "type": "module",
   "bin": {
-    "clanker-stats": "cli.js"
+    "fair-clanker-stats": "cli.js"
   },
   "files": [
     "cli.js",
@@ -18,10 +18,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dnakov/clanker-stats.git"
+    "url": "git+https://github.com/8tomat8/fair-clanker-stats.git"
   },
-  "homepage": "https://github.com/dnakov/clanker-stats",
+  "homepage": "https://github.com/8tomat8/fair-clanker-stats",
   "bugs": {
-    "url": "https://github.com/dnakov/clanker-stats/issues"
+    "url": "https://github.com/8tomat8/fair-clanker-stats/issues"
   }
 }
