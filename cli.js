@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 
 import { readFile, writeFile } from "node:fs/promises"
-import { createReadStream } from "node:fs"
+import { createReadStream, existsSync } from "node:fs"
 import { createInterface } from "node:readline"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { execFileSync } from "node:child_process"
 import fg from "fast-glob"
 import { Resvg } from "@resvg/resvg-js"
+
+let Database = null
+try {
+  Database = (await import('better-sqlite3')).default
+} catch {}
 
 const home = homedir()
 const toDate = (ms) => new Date(ms).toISOString().slice(0, 10)
@@ -65,8 +70,48 @@ async function collectCodex() {
   return counts
 }
 
+function findOpenCodeDb() {
+  const candidates = [
+    join(home, ".local", "share", "opencode", "opencode.db"),
+    ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "opencode.db")] : []),
+  ]
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+  return null
+}
+
 async function collectOpenCode() {
   const counts = new Map()
+  const dbPath = Database ? findOpenCodeDb() : null
+  if (dbPath) {
+    let db
+    try {
+      db = new Database(dbPath, { readonly: true, fileMustExist: true })
+      const rows = db.prepare(`
+        SELECT
+          date(time_created / 1000, 'unixepoch') as day,
+          SUM(
+            COALESCE(json_extract(data, '$.tokens.input'), 0) +
+            COALESCE(json_extract(data, '$.tokens.output'), 0) +
+            COALESCE(json_extract(data, '$.tokens.reasoning'), 0) +
+            COALESCE(json_extract(data, '$.tokens.cache.read'), 0) +
+            COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
+          ) as total_tokens
+        FROM message
+        WHERE json_extract(data, '$.role') = 'assistant'
+        GROUP BY day
+        HAVING total_tokens > 0
+      `).all()
+      for (const row of rows) {
+        if (row.day && row.total_tokens > 0) add(counts, row.day, row.total_tokens)
+      }
+    } catch {} finally {
+      db?.close()
+    }
+    return counts
+  }
+  // JSON fallback — existing logic below
   const dirs = [
     join(home, ".local", "share", "opencode", "storage", "message"),
     ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "storage", "message")] : []),
@@ -252,6 +297,45 @@ async function collectTimeVibe() {
 
 async function collectTimeOpenCode() {
   const counts = new Map()
+  const dbPath = Database ? findOpenCodeDb() : null
+  if (dbPath) {
+    let db
+    try {
+      db = new Database(dbPath, { readonly: true, fileMustExist: true })
+      const rows = db.prepare(`
+        SELECT
+          session_id as sid,
+          json_extract(data, '$.role') as role,
+          time_created as ts
+        FROM message
+        WHERE session_id IS NOT NULL
+          AND time_created IS NOT NULL
+        ORDER BY time_created
+      `).all()
+      const sessions = new Map()
+      for (const row of rows) {
+        if (!sessions.has(row.sid)) sessions.set(row.sid, [])
+        sessions.get(row.sid).push({ role: row.role, ts: row.ts })
+      }
+      for (const msgs of sessions.values()) {
+        let turnStart = null, turnEnd = null
+        for (const m of msgs) {
+          if (m.role === "user") {
+            addTurnHours(counts, turnStart, turnEnd)
+            turnStart = m.ts
+            turnEnd = null
+          } else if (m.role === "assistant" && turnStart) {
+            turnEnd = m.ts
+          }
+        }
+        addTurnHours(counts, turnStart, turnEnd)
+      }
+    } catch {} finally {
+      db?.close()
+    }
+    return counts
+  }
+  // JSON fallback — existing logic below
   const dirs = [
     join(home, ".local", "share", "opencode", "storage", "message"),
     ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "storage", "message")] : []),
