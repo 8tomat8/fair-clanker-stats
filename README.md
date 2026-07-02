@@ -16,7 +16,8 @@ Generates `chart.png` in the current directory and opens it.
 
 ```bash
 npx fair-clanker-stats --hours    # show hours per day instead of tokens
-npx fair-clanker-stats --share    # copy chart to clipboard + open X
+npx fair-clanker-stats --cost  # show $ spent per day (OpenCode, Pi, Oh My Pi)
+npx fair-clanker-stats --share # copy chart to clipboard + open X
 ```
 
 ### Run from source
@@ -30,12 +31,15 @@ node cli.js
 
 ## Supported tools
 
-| Tool | Data source |
-|------|------------|
-| Claude Code | `~/.claude/projects/` |
-| Codex | `~/.codex/sessions/` |
-| OpenCode | `~/.local/share/opencode/` (SQLite + JSON fallback) |
-| Gemini CLI | `~/.gemini/tmp/` |
-| Amp | `~/.local/share/amp/threads/` |
-| Pi | `~/.pi/agent/sessions/` |
-| Mistral Vibe | `~/.vibe/logs/session/` |
+| Tool | Data source | `--cost` |
+|------|------------|:---:|
+| Claude Code | `~/.claude/projects/` | — |
+| Codex | `~/.codex/sessions/` | — |
+| OpenCode | `~/.local/share/opencode/` (SQLite + JSON) | ✓ |
+| Gemini CLI | `~/.gemini/tmp/` | — |
+| Amp | `~/.local/share/amp/threads/` | — |
+| Pi | `~/.pi/agent/sessions/` | ✓ |
+| Oh My Pi | `~/.omp/agent/sessions/` | ✓ |
+| Mistral Vibe | `~/.vibe/logs/session/` | — |
+
+`--cost` shows API-billed spend as recorded by the tool itself; subscription-covered usage records $0.

@@ -4,7 +4,7 @@ import { readFile, writeFile } from "node:fs/promises"
 import { createReadStream, existsSync } from "node:fs"
 import { createInterface } from "node:readline"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, basename } from "node:path"
 import { execFileSync } from "node:child_process"
 import fg from "fast-glob"
 import { Resvg } from "@resvg/resvg-js"
@@ -70,64 +70,93 @@ async function collectCodex() {
   return counts
 }
 
+const openCodeRoots = () => [
+  join(home, ".local", "share", "opencode"),
+  ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode")] : []),
+]
+
 function findOpenCodeDb() {
-  const candidates = [
-    join(home, ".local", "share", "opencode", "opencode.db"),
-    ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "opencode.db")] : []),
-  ]
-  for (const p of candidates) {
+  for (const root of openCodeRoots()) {
+    const p = join(root, "opencode.db")
     if (existsSync(p)) return p
   }
   return null
 }
 
-async function collectOpenCode() {
-  const counts = new Map()
-  const dbPath = Database ? findOpenCodeDb() : null
-  if (dbPath) {
-    let db
-    try {
-      db = new Database(dbPath, { readonly: true, fileMustExist: true })
-      const rows = db.prepare(`
-        SELECT
-          date(time_created / 1000, 'unixepoch') as day,
-          SUM(
-            COALESCE(json_extract(data, '$.tokens.input'), 0) +
-            COALESCE(json_extract(data, '$.tokens.output'), 0) +
-            COALESCE(json_extract(data, '$.tokens.reasoning'), 0) +
-            COALESCE(json_extract(data, '$.tokens.cache.read'), 0) +
-            COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
-          ) as total_tokens
-        FROM message
-        WHERE json_extract(data, '$.role') = 'assistant'
-        GROUP BY day
-        HAVING total_tokens > 0
-      `).all()
-      for (const row of rows) {
-        if (row.day && row.total_tokens > 0) add(counts, row.day, row.total_tokens)
-      }
-    } catch {} finally {
-      db?.close()
-    }
-    return counts
-  }
-  // JSON fallback — existing logic below
-  const dirs = [
-    join(home, ".local", "share", "opencode", "storage", "message"),
-    ...(process.platform === "darwin" ? [join(home, "Library", "Application Support", "opencode", "storage", "message")] : []),
+// OpenCode keeps messages in up to three stores: opencode.db, the legacy
+// storage/message/ tree, and project-scoped project/*/storage/session/message/
+// (incl. project/global). The db does not contain all of them, so scan the
+// JSON trees too, skipping message ids already counted elsewhere.
+async function scanOpenCodeJson(skipIds, onMessage) {
+  const seen = new Set()
+  const patterns = [
+    "storage/message/ses_*/msg_*.json",
+    "project/*/storage/session/message/ses_*/msg_*.json",
   ]
-  for (const dir of dirs)
-  for (const path of await fg("ses_*/msg_*.json", { cwd: dir, suppressErrors: true })) {
+  for (const root of openCodeRoots())
+  for (const path of await fg(patterns, { cwd: root, suppressErrors: true })) {
+    const id = basename(path, ".json")
+    if (skipIds.has(id) || seen.has(id)) continue
+    seen.add(id)
     try {
-      const obj = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      const obj = JSON.parse(await readFile(join(root, path), "utf-8"))
       if (obj.role !== "assistant") continue
-      const t = obj.tokens
-      if (!t) continue
-      const tokens = (t.input || 0) + (t.output || 0) + (t.reasoning || 0) +
-        (t.cache?.read || 0) + (t.cache?.write || 0)
-      if (tokens > 0 && obj.time?.created) add(counts, toDate(obj.time.created), tokens)
+      onMessage(obj)
     } catch {}
   }
+}
+
+function collectOpenCodeDb(counts, valueExpr) {
+  const dbIds = new Set()
+  const dbPath = Database ? findOpenCodeDb() : null
+  if (!dbPath) return dbIds
+  let db
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true })
+    const rows = db.prepare(`
+      SELECT
+        date(time_created / 1000, 'unixepoch') as day,
+        SUM(${valueExpr}) as total
+      FROM message
+      WHERE json_extract(data, '$.role') = 'assistant'
+      GROUP BY day
+      HAVING total > 0
+    `).all()
+    for (const row of rows) {
+      if (row.day && row.total > 0) add(counts, row.day, row.total)
+    }
+    for (const id of db.prepare("SELECT id FROM message").pluck().all()) dbIds.add(id)
+  } catch {} finally {
+    db?.close()
+  }
+  return dbIds
+}
+
+async function collectOpenCode() {
+  const counts = new Map()
+  const dbIds = collectOpenCodeDb(counts, `
+    COALESCE(json_extract(data, '$.tokens.input'), 0) +
+    COALESCE(json_extract(data, '$.tokens.output'), 0) +
+    COALESCE(json_extract(data, '$.tokens.reasoning'), 0) +
+    COALESCE(json_extract(data, '$.tokens.cache.read'), 0) +
+    COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
+  `)
+  await scanOpenCodeJson(dbIds, (obj) => {
+    const t = obj.tokens
+    if (!t) return
+    const tokens = (t.input || 0) + (t.output || 0) + (t.reasoning || 0) +
+      (t.cache?.read || 0) + (t.cache?.write || 0)
+    if (tokens > 0 && obj.time?.created) add(counts, toDate(obj.time.created), tokens)
+  })
+  return counts
+}
+
+async function collectCostOpenCode() {
+  const counts = new Map()
+  const dbIds = collectOpenCodeDb(counts, `COALESCE(json_extract(data, '$.cost'), 0)`)
+  await scanOpenCodeJson(dbIds, (obj) => {
+    if (obj.cost > 0 && obj.time?.created) add(counts, toDate(obj.time.created), obj.cost)
+  })
   return counts
 }
 
@@ -169,9 +198,8 @@ async function collectAmp() {
   return counts
 }
 
-async function collectPi() {
+async function collectPiFormat(dir) {
   const counts = new Map()
-  const dir = join(home, ".pi", "agent", "sessions")
   for (const path of await fg("**/*.jsonl", { cwd: dir })) {
     const text = await readFile(join(dir, path), "utf-8")
     for (const line of text.split("\n")) {
@@ -187,6 +215,30 @@ async function collectPi() {
   }
   return counts
 }
+
+const collectPi = () => collectPiFormat(join(home, ".pi", "agent", "sessions"))
+const collectOmp = () => collectPiFormat(join(home, ".omp", "agent", "sessions"))
+
+async function collectCostPiFormat(dir) {
+  const counts = new Map()
+  for (const path of await fg("**/*.jsonl", { cwd: dir })) {
+    const text = await readFile(join(dir, path), "utf-8")
+    for (const line of text.split("\n")) {
+      if (!line.includes('"cost"')) continue
+      try {
+        const obj = JSON.parse(line)
+        if (obj.type !== "message") continue
+        const u = obj.message?.usage || obj.usage
+        const c = u?.cost?.total
+        if (c > 0 && obj.timestamp) add(counts, isoToDate(obj.timestamp), c)
+      } catch {}
+    }
+  }
+  return counts
+}
+
+const collectCostPi = () => collectCostPiFormat(join(home, ".pi", "agent", "sessions"))
+const collectCostOmp = () => collectCostPiFormat(join(home, ".omp", "agent", "sessions"))
 
 // --hours: collect hours per day from user→last assistant message time diffs
 function addTurnHours(map, turnStart, turnEnd) {
@@ -398,10 +450,11 @@ async function collectTimeAmp() {
   return new Map() // no per-message timestamps on assistant messages
 }
 
-async function collectTimePi() {
+async function collectTimePiFormat(dir) {
   const counts = new Map()
-  const dir = join(home, ".pi", "agent", "sessions")
-  for (const path of await fg("**/*.jsonl", { cwd: dir })) {
+  // */*.jsonl only: subagent transcripts live deeper and their wall-clock
+  // overlaps the parent turn — counting both would double-book hours
+  for (const path of await fg("*/*.jsonl", { cwd: dir })) {
     const text = await readFile(join(dir, path), "utf-8")
     let turnStart = null, turnEnd = null
     for (const line of text.split("\n")) {
@@ -425,13 +478,17 @@ async function collectTimePi() {
   return counts
 }
 
+const collectTimePi = () => collectTimePiFormat(join(home, ".pi", "agent", "sessions"))
+const collectTimeOmp = () => collectTimePiFormat(join(home, ".omp", "agent", "sessions"))
+
 const tools = [
   { name: "Claude Code", collect: collectClaude, collectTime: collectTimeClaude, color: "#f97316" },
   { name: "Codex", collect: collectCodex, collectTime: collectTimeCodex, color: "#22c55e" },
-  { name: "OpenCode", collect: collectOpenCode, collectTime: collectTimeOpenCode, color: "#3b82f6" },
+  { name: "OpenCode", collect: collectOpenCode, collectTime: collectTimeOpenCode, collectCost: collectCostOpenCode, color: "#3b82f6" },
   { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, color: "#eab308" },
   { name: "Amp", collect: collectAmp, collectTime: collectTimeAmp, color: "#a855f7" },
-  { name: "Pi", collect: collectPi, collectTime: collectTimePi, color: "#ec4899" },
+  { name: "Pi", collect: collectPi, collectTime: collectTimePi, collectCost: collectCostPi, color: "#ec4899" },
+  { name: "Oh My Pi", collect: collectOmp, collectTime: collectTimeOmp, collectCost: collectCostOmp, color: "#14b8a6" },
   { name: "Mistral Vibe", collect: collectVibe, collectTime: collectTimeVibe, color: "#6366f1" },
 ]
 
@@ -463,6 +520,12 @@ function formatHours(h) {
   if (h >= 10) return h.toFixed(1).replace(/\.0$/, "") + "h"
   if (h >= 1) return h.toFixed(1) + "h"
   return Math.round(h * 60) + "m"
+}
+
+function formatMoney(n) {
+  if (n >= 999.5) return "$" + (n / 1000).toFixed(1).replace(/\.0$/, "") + "k"
+  if (n >= 100) return "$" + Math.round(n)
+  return "$" + n.toFixed(2).replace(/\.00$/, "")
 }
 
 const resvgFontOpts = { loadSystemFonts: true }
@@ -606,16 +669,32 @@ function openPath(target) {
 }
 
 async function main() {
-  const share = process.argv.includes("--share")
-  const hours = process.argv.includes("--hours")
+  const args = process.argv.slice(2)
+  const known = new Set(["--share", "--hours", "--cost"])
+  const unknown = args.filter(a => !known.has(a))
+  if (unknown.length) {
+    console.error(`Unknown option${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`)
+    console.error("Usage: npx fair-clanker-stats [--hours | --cost] [--share]")
+    process.exit(1)
+  }
+  const share = args.includes("--share")
+  const hours = args.includes("--hours")
+  const cost = args.includes("--cost")
+  if (cost && hours) {
+    console.error("--cost and --hours are mutually exclusive")
+    process.exit(1)
+  }
+  const fmt = cost ? formatMoney : hours ? formatHours : (n) => formatTotal(n) + " tokens"
   const results = []
 
   for (const tool of tools) {
     try {
-      const counts = hours ? await tool.collectTime() : await tool.collect()
+      const counts = cost
+        ? (tool.collectCost ? await tool.collectCost() : new Map())
+        : hours ? await tool.collectTime() : await tool.collect()
       results.push({ name: tool.name, color: tool.color, counts })
       const t = [...counts.values()].reduce((a, b) => a + b, 0)
-      console.log(`${tool.name}: ${hours ? formatHours(t) : formatTotal(t) + " tokens"}`)
+      console.log(`${tool.name}: ${cost && !tool.collectCost ? "no cost data" : fmt(t)}`)
     } catch (e) {
       console.warn(`${tool.name}: skipped (${e?.message || e})`)
       results.push({ name: tool.name, color: tool.color, counts: new Map() })
@@ -639,10 +718,12 @@ async function main() {
   }
 
   const total = results.reduce((sum, r) => sum + [...r.counts.values()].reduce((a, b) => a + b, 0), 0)
-  const chartOpts = hours
+  const chartOpts = cost
+    ? { unit: "USD", cmd: `npx fair-clanker-stats --cost${share ? " --share" : ""}`, formatVal: formatMoney }
+    : hours
     ? { unit: "HOURS", cmd: `npx fair-clanker-stats --hours${share ? " --share" : ""}`, formatVal: formatHours }
     : share ? {} : { cmd: "npx fair-clanker-stats" }
-  console.log(`\n${allDays.length} days, ${hours ? formatHours(total) : formatTotal(total) + " total tokens"}`)
+  console.log(`\n${allDays.length} days, ${cost || hours ? fmt(total) : formatTotal(total) + " total tokens"}`)
 
   const svg = renderChart(allDays, results, total, chartOpts)
   const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1500 }, font: resvgFontOpts })
@@ -661,8 +742,8 @@ async function main() {
       console.log("Copy the image manually: " + outPath)
     }
     const visible = results.filter(r => [...r.counts.values()].reduce((a, b) => a + b, 0) > 0)
-    const label = hours ? `${Math.round(total)} hours` : `${formatTotal(total)} tokens`
-    const flag = hours ? " --hours" : ""
+    const label = cost ? `${formatMoney(total)} spent` : hours ? `${Math.round(total)} hours` : `${formatTotal(total)} tokens`
+    const flag = cost ? " --cost" : hours ? " --hours" : ""
     const text = `${label} across ${visible.length} AI coding tools\n\nnpx fair-clanker-stats${flag}`
     openPath(`https://x.com/intent/post?text=${encodeURIComponent(text)}`)
     console.log("Paste the image from your clipboard into the post")
