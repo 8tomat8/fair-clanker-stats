@@ -74,6 +74,66 @@ function anthropicCost([inp, out], u) {
     + w1h * inp * 2) / 1e6
 }
 
+// OpenAI price table (USD per MTok, [input, output, cacheRead]), models.dev snapshot 2026-07-02.
+// -fast variants = priority processing tier, 2x base rate (no published table; assumption).
+const OPENAI_RATES = {
+  "gpt-5.5-fast": [10, 60, 1],
+  "gpt-5.5": [5, 30, 0.5],
+  "gpt-5.4-mini-fast": [1.5, 9, 0.15],
+  "gpt-5.4-mini": [0.75, 4.5, 0.075],
+  "gpt-5.4-fast": [5, 30, 0.5],
+  "gpt-5.4-nano": [0.2, 1.25, 0.02],
+  "gpt-5.4": [2.5, 15, 0.25],
+  "gpt-5.3-codex": [1.75, 14, 0.175],
+  "gpt-5.2": [1.75, 14, 0.175],
+  "gpt-5.1-codex-mini": [0.25, 2, 0.025],
+  "gpt-5.1": [1.25, 10, 0.125],
+  "gpt-5": [1.25, 10, 0.125],
+}
+
+// Google price table (USD per MTok, [input, output, cacheRead]), vertex list rates.
+const GOOGLE_RATES = {
+  "gemini-3-pro": [2, 12, 0.2],
+  "gemini-3-flash": [0.5, 3, 0.05],
+  "gemini-2.5-pro": [1.25, 10, 0.125],
+  "gemini-2.5-flash": [0.3, 2.5, 0.075],
+}
+
+function prefixRates(table, model) {
+  if (!model) return null
+  let m = model.toLowerCase()
+  m = m.slice(m.lastIndexOf("/") + 1)
+  if (table[m]) return table[m]
+  for (const k in table) if (m.startsWith(k)) return table[k]
+  return null
+}
+const openaiRates = (model) => prefixRates(OPENAI_RATES, model)
+
+// --cost --estimate: price uncosted (subscription-billed) usage at API list rates.
+let estimateMode = false
+
+// One usage aggregate -> USD. OpenCode-shaped splits: input excludes cache
+// reads, reasoning separate from output. OpenAI-shaped callers pre-subtract
+// cached from input and fold reasoning into output before calling.
+function estimateUsd(provider, model, ts, t) {
+  if (provider === "anthropic") {
+    const r = anthropicRates(model, ts)
+    if (!r) return 0
+    return (t.in * r[0] + (t.out + t.reason) * r[1] + t.cr * r[0] * 0.1 + t.cw * r[0] * 1.25) / 1e6
+  }
+  if (provider === "openai") {
+    const r = openaiRates(model)
+    if (!r) return 0
+    return (t.in * r[0] + (t.out + t.reason) * r[1] + t.cr * r[2]) / 1e6
+  }
+  if (provider === "google") {
+    const r = prefixRates(GOOGLE_RATES, model)
+    if (!r) return 0
+    return (t.in * r[0] + (t.out + t.reason) * r[1] + t.cr * r[2]) / 1e6
+  }
+  return 0
+}
+
 async function collectClaude() {
   const counts = new Map()
   const dir = join(home, ".claude", "projects")
@@ -146,6 +206,47 @@ async function collectCodex() {
           if (!tokens && cumTotal != null && prevCumulative != null) tokens = cumTotal - prevCumulative
           if (cumTotal != null) prevCumulative = cumTotal
           if (tokens > 0 && obj.timestamp) add(counts, isoToDate(obj.timestamp), tokens)
+        } catch {}
+      }
+    } catch {}
+  }
+  return counts
+}
+
+// Codex records no cost; estimate from per-event usage at OpenAI list rates.
+// input_tokens includes cached; reasoning is a subset of output (Responses API).
+async function collectCostCodex() {
+  const counts = new Map()
+  if (!estimateMode) return counts
+  const dir = join(home, ".codex", "sessions")
+  for (const path of await fg("**/*.jsonl", { cwd: dir })) {
+    try {
+      const rl = createInterface({ input: createReadStream(join(dir, path)), crlfDelay: Infinity })
+      let model = null, prevCumulative = null
+      for await (const line of rl) {
+        if (line.includes('"model"') && (line.includes('"session_meta"') || line.includes('"turn_context"'))) {
+          try {
+            const obj = JSON.parse(line)
+            model = obj.payload?.model || obj.payload?.turn_context?.model || model
+          } catch {}
+          continue
+        }
+        if (!line.includes('"token_count"')) continue
+        try {
+          const obj = JSON.parse(line)
+          if (obj.payload?.type !== "token_count") continue
+          const cumTotal = obj.payload.info?.total_token_usage?.total_tokens
+          if (cumTotal != null && cumTotal === prevCumulative) continue
+          const u = obj.payload.info?.last_token_usage
+          if (cumTotal != null) prevCumulative = cumTotal
+          if (!u || !obj.timestamp) continue
+          const rates = openaiRates(model)
+          if (!rates) continue
+          const cached = u.cached_input_tokens || 0
+          const usd = ((Math.max((u.input_tokens || 0) - cached, 0)) * rates[0]
+            + cached * rates[2]
+            + (u.output_tokens || 0) * rates[1]) / 1e6
+          if (usd > 0) add(counts, isoToDate(obj.timestamp), usd)
         } catch {}
       }
     } catch {}
@@ -234,11 +335,57 @@ async function collectOpenCode() {
   return counts
 }
 
+// Estimate one OpenCode message's cost from its token splits.
+const openCodeEstimate = (obj) => estimateUsd(obj.providerID, obj.modelID, obj.time?.created, {
+  in: obj.tokens?.input || 0,
+  out: obj.tokens?.output || 0,
+  reason: obj.tokens?.reasoning || 0,
+  cr: obj.tokens?.cache?.read || 0,
+  cw: obj.tokens?.cache?.write || 0,
+})
+
 async function collectCostOpenCode() {
   const counts = new Map()
   const dbIds = collectOpenCodeDb(counts, `COALESCE(json_extract(data, '$.cost'), 0)`)
+  if (estimateMode) {
+    // subscription-billed rows record cost=0; price them at API list rates
+    const dbPath = Database ? findOpenCodeDb() : null
+    if (dbPath) {
+      let db
+      try {
+        db = new Database(dbPath, { readonly: true, fileMustExist: true })
+        const rows = db.prepare(`
+          SELECT
+            date(time_created / 1000, 'unixepoch') as day,
+            time_created as ts,
+            json_extract(data, '$.providerID') as prov,
+            json_extract(data, '$.modelID') as model,
+            SUM(COALESCE(json_extract(data, '$.tokens.input'), 0)) as tin,
+            SUM(COALESCE(json_extract(data, '$.tokens.output'), 0)) as tout,
+            SUM(COALESCE(json_extract(data, '$.tokens.reasoning'), 0)) as treason,
+            SUM(COALESCE(json_extract(data, '$.tokens.cache.read'), 0)) as tcr,
+            SUM(COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) as tcw
+          FROM message
+          WHERE json_extract(data, '$.role') = 'assistant'
+            AND COALESCE(json_extract(data, '$.cost'), 0) = 0
+          GROUP BY day, prov, model
+        `).all()
+        for (const r of rows) {
+          const usd = estimateUsd(r.prov, r.model, r.ts, { in: r.tin, out: r.tout, reason: r.treason, cr: r.tcr, cw: r.tcw })
+          if (usd > 0 && r.day) add(counts, r.day, usd)
+        }
+      } catch {} finally {
+        db?.close()
+      }
+    }
+  }
   await scanOpenCodeJson(dbIds, (obj) => {
-    if (obj.cost > 0 && obj.time?.created) add(counts, toDate(obj.time.created), obj.cost)
+    if (!obj.time?.created) return
+    if (obj.cost > 0) add(counts, toDate(obj.time.created), obj.cost)
+    else if (estimateMode) {
+      const usd = openCodeEstimate(obj)
+      if (usd > 0) add(counts, toDate(obj.time.created), usd)
+    }
   })
   return counts
 }
@@ -275,6 +422,54 @@ async function collectAmp() {
         if (!u) continue
         const tokens = (u.totalInputTokens || 0) + (u.outputTokens || 0)
         if (tokens > 0) add(counts, date, tokens)
+      }
+    } catch {}
+  }
+  return counts
+}
+
+// Gemini CLI records no cost; estimate from token splits at vertex list rates.
+// (Personal OAuth usage is free-tier; the estimate shows list-rate value anyway.)
+async function collectCostGemini() {
+  const counts = new Map()
+  if (!estimateMode) return counts
+  const dir = join(home, ".gemini", "tmp")
+  for (const path of await fg("*/chats/*.json", { cwd: dir })) {
+    try {
+      const obj = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      for (const msg of obj.messages || []) {
+        if (msg.type !== "gemini" || !msg.tokens || !msg.timestamp) continue
+        const t = msg.tokens
+        const usd = estimateUsd("google", msg.model, msg.timestamp, {
+          in: (t.input || 0) + (t.tool || 0), out: t.output || 0,
+          reason: t.thoughts || 0, cr: t.cached || 0, cw: 0,
+        })
+        if (usd > 0) add(counts, isoToDate(msg.timestamp), usd)
+      }
+    } catch {}
+  }
+  return counts
+}
+
+// Amp records no cost; estimate from per-message usage at Anthropic list rates.
+async function collectCostAmp() {
+  const counts = new Map()
+  if (!estimateMode) return counts
+  const dir = join(home, ".local", "share", "amp", "threads")
+  for (const path of await fg("T-*.json", { cwd: dir })) {
+    try {
+      const obj = JSON.parse(await readFile(join(dir, path), "utf-8"))
+      const threadDate = obj.created ? toDate(obj.created) : null
+      for (const msg of obj.messages || []) {
+        const u = msg.usage
+        if (!u) continue
+        const date = u.timestamp ? isoToDate(u.timestamp) : threadDate
+        if (!date) continue
+        const usd = estimateUsd("anthropic", u.model, u.timestamp, {
+          in: u.inputTokens || 0, out: u.outputTokens || 0, reason: 0,
+          cr: u.cacheReadInputTokens || 0, cw: u.cacheCreationInputTokens || 0,
+        })
+        if (usd > 0) add(counts, date, usd)
       }
     } catch {}
   }
@@ -578,10 +773,10 @@ const collectTimeOmp = () => collectTimePiFormat(join(home, ".omp", "agent", "se
 
 const tools = [
   { name: "Claude Code", collect: collectClaude, collectTime: collectTimeClaude, collectCost: collectCostClaude, color: "#f97316" },
-  { name: "Codex", collect: collectCodex, collectTime: collectTimeCodex, color: "#22c55e" },
+  { name: "Codex", collect: collectCodex, collectTime: collectTimeCodex, collectCost: collectCostCodex, estOnly: true, color: "#22c55e" },
   { name: "OpenCode", collect: collectOpenCode, collectTime: collectTimeOpenCode, collectCost: collectCostOpenCode, color: "#3b82f6" },
-  { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, color: "#eab308" },
-  { name: "Amp", collect: collectAmp, collectTime: collectTimeAmp, color: "#a855f7" },
+  { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, collectCost: collectCostGemini, estOnly: true, color: "#eab308" },
+  { name: "Amp", collect: collectAmp, collectTime: collectTimeAmp, collectCost: collectCostAmp, estOnly: true, color: "#a855f7" },
   { name: "Pi", collect: collectPi, collectTime: collectTimePi, collectCost: collectCostPi, color: "#ec4899" },
   { name: "Oh My Pi", collect: collectOmp, collectTime: collectTimeOmp, collectCost: collectCostOmp, color: "#14b8a6" },
   { name: "Mistral Vibe", collect: collectVibe, collectTime: collectTimeVibe, color: "#6366f1" },
@@ -738,20 +933,22 @@ function openPath(target) {
 
 async function main() {
   const args = process.argv.slice(2)
-  const known = new Set(["--share", "--hours", "--cost"])
+  const known = new Set(["--share", "--hours", "--cost", "--no-estimate"])
   const unknown = args.filter(a => !known.has(a))
   if (unknown.length) {
     console.error(`Unknown option${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`)
-    console.error("Usage: npx fair-clanker-stats [--hours | --cost] [--share]")
+    console.error("Usage: npx fair-clanker-stats [--hours | --cost [--no-estimate]] [--share]")
     process.exit(1)
   }
   const share = args.includes("--share")
   const hours = args.includes("--hours")
   const cost = args.includes("--cost")
+  const estimate = cost && !args.includes("--no-estimate")
   if (cost && hours) {
     console.error("--cost and --hours are mutually exclusive")
     process.exit(1)
   }
+  estimateMode = estimate
   const fmt = cost ? formatMoney : hours ? formatHours : (n) => formatTotal(n) + " tokens"
   const results = []
 
@@ -762,7 +959,8 @@ async function main() {
         : hours ? await tool.collectTime() : await tool.collect()
       results.push({ name: tool.name, color: tool.color, counts })
       const t = [...counts.values()].reduce((a, b) => a + b, 0)
-      console.log(`${tool.name}: ${cost && !tool.collectCost ? "no cost data" : fmt(t)}`)
+      const noData = cost && (!tool.collectCost || (tool.estOnly && !estimate))
+      console.log(`${tool.name}: ${noData ? "no cost data" : fmt(t)}`)
     } catch (e) {
       console.warn(`${tool.name}: skipped (${e?.message || e})`)
       results.push({ name: tool.name, color: tool.color, counts: new Map() })
@@ -787,7 +985,7 @@ async function main() {
 
   const total = results.reduce((sum, r) => sum + [...r.counts.values()].reduce((a, b) => a + b, 0), 0)
   const chartOpts = cost
-    ? { unit: "USD", cmd: `npx fair-clanker-stats --cost${share ? " --share" : ""}`, formatVal: formatMoney }
+    ? { unit: estimate ? "USD (EST)" : "USD", cmd: `npx fair-clanker-stats --cost${estimate ? "" : " --no-estimate"}${share ? " --share" : ""}`, formatVal: formatMoney }
     : hours
     ? { unit: "HOURS", cmd: `npx fair-clanker-stats --hours${share ? " --share" : ""}`, formatVal: formatHours }
     : share ? {} : { cmd: "npx fair-clanker-stats" }

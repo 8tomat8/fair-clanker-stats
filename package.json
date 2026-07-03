@@ -1,6 +1,6 @@
 {
   "name": "fair-clanker-stats",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "See how many tokens you've burned across AI coding tools (with SQLite support for OpenCode)",
   "type": "module",
   "bin": {
