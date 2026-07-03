@@ -22,6 +22,56 @@ function add(map, date, n) {
   map.set(date, (map.get(date) || 0) + n)
 }
 
+// Anthropic price table (USD per MTok, [input, output]), snapshot 2026-07-02
+// from https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+// Derived rates: cache read = 0.1x input, 5m cache write = 1.25x, 1h write = 2x.
+const ANTHROPIC_RATES = {
+  "claude-fable-5": [10, 50],
+  "claude-mythos-5": [10, 50],
+  "claude-opus-4-8": [5, 25],
+  "claude-opus-4-7": [5, 25],
+  "claude-opus-4-6": [5, 25],
+  "claude-opus-4-5": [5, 25],
+  "claude-opus-4-1": [15, 75],
+  "claude-opus-4": [15, 75],
+  "claude-sonnet-5": [2, 10], // 3/15 from 2026-09-01, handled below
+  "claude-sonnet-4-6": [3, 15],
+  "claude-sonnet-4-5": [3, 15],
+  "claude-sonnet-4": [3, 15],
+  "claude-haiku-4-5": [1, 5],
+  "claude-haiku-3-5": [0.8, 4],
+  "claude-3-7-sonnet": [3, 15],
+  "claude-3-5-sonnet": [3, 15],
+  "claude-3-5-haiku": [0.8, 4],
+  "claude-3-opus": [15, 75],
+  "claude-3-haiku": [0.25, 1.25],
+}
+
+function anthropicRates(model, ts) {
+  if (!model) return null
+  let m = model.toLowerCase()
+  m = m.slice(m.lastIndexOf("/") + 1)                     // strip provider prefix
+  m = m.replace(/^(?:[a-z]{2}\.)?anthropic\./, "")        // bedrock region/vendor prefix
+  m = m.replace(/-v\d+(?::\d+)?$/, "")                    // bedrock -v1:0
+  m = m.replace(/[-@]\d{8}$/, "")                         // date suffix
+  if (m.startsWith("claude-sonnet-5") && ts && new Date(ts) >= new Date("2026-09-01")) return [3, 15]
+  if (ANTHROPIC_RATES[m]) return ANTHROPIC_RATES[m]
+  for (const k in ANTHROPIC_RATES) if (m.startsWith(k)) return ANTHROPIC_RATES[k]
+  return null
+}
+
+// TTL-aware cache-write pricing, mirrors Claude Code's own cost function:
+// ephemeral_1h tokens bill at 2x input, the rest at 1.25x.
+function anthropicCost([inp, out], u) {
+  const wTotal = u.cache_creation_input_tokens || 0
+  const w1h = Math.min(u.cache_creation?.ephemeral_1h_input_tokens || 0, wTotal)
+  return ((u.input_tokens || 0) * inp
+    + (u.output_tokens || 0) * out
+    + (u.cache_read_input_tokens || 0) * inp * 0.1
+    + (wTotal - w1h) * inp * 1.25
+    + w1h * inp * 2) / 1e6
+}
+
 async function collectClaude() {
   const counts = new Map()
   const dir = join(home, ".claude", "projects")
@@ -39,6 +89,37 @@ async function collectClaude() {
         const tokens = (u.input_tokens || 0) + (u.output_tokens || 0) +
           (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0)
         if (tokens > 0) add(counts, isoToDate(obj.timestamp), tokens)
+      } catch {}
+    }
+  }
+  return counts
+}
+
+// Claude Code writes no cost to disk; compute it ccusage-style from tokens.
+async function collectCostClaude() {
+  const counts = new Map()
+  const dir = join(home, ".claude", "projects")
+  const seen = new Set()
+  for (const path of await fg("*/*.jsonl", { cwd: dir })) {
+    if (path.includes("/subagents/")) continue
+    const text = await readFile(join(dir, path), "utf-8")
+    for (const line of text.split("\n")) {
+      if (!line.includes('"assistant"') || !line.includes('"usage"')) continue
+      try {
+        const obj = JSON.parse(line)
+        if (obj.type !== "assistant" || obj.isSidechain) continue
+        const u = obj.message?.usage
+        if (!u || !obj.timestamp) continue
+        if (obj.message.model === "<synthetic>") continue
+        const rates = anthropicRates(obj.message.model, obj.timestamp)
+        if (!rates) continue
+        if (obj.message.id) {
+          const key = `${obj.message.id}:${obj.requestId || ""}`
+          if (seen.has(key)) continue
+          seen.add(key)
+        }
+        const cost = anthropicCost(rates, u)
+        if (cost > 0) add(counts, isoToDate(obj.timestamp), cost)
       } catch {}
     }
   }
@@ -229,8 +310,20 @@ async function collectCostPiFormat(dir) {
         const obj = JSON.parse(line)
         if (obj.type !== "message") continue
         const u = obj.message?.usage || obj.usage
-        const c = u?.cost?.total
-        if (c > 0 && obj.timestamp) add(counts, isoToDate(obj.timestamp), c)
+        let c = u?.cost?.total
+        if (!(c > 0) || !obj.timestamp) continue
+        // Pi/OMP price all cache writes at the 5m rate; rebill 1h-TTL writes at 2x input.
+        // No-op when the recorded cacheWrite cost already matches the TTL-aware price.
+        const t1h = u.cttl?.ephemeral1h || 0
+        if (t1h > 0) {
+          const rates = anthropicRates(obj.message?.model, obj.timestamp)
+          if (rates) {
+            const w = u.cacheWrite || 0
+            const correct = (Math.min(t1h, w) * 2 + Math.max(w - t1h, 0) * 1.25) * rates[0] / 1e6
+            c += correct - (u.cost.cacheWrite || 0)
+          }
+        }
+        add(counts, isoToDate(obj.timestamp), c)
       } catch {}
     }
   }
@@ -482,7 +575,7 @@ const collectTimePi = () => collectTimePiFormat(join(home, ".pi", "agent", "sess
 const collectTimeOmp = () => collectTimePiFormat(join(home, ".omp", "agent", "sessions"))
 
 const tools = [
-  { name: "Claude Code", collect: collectClaude, collectTime: collectTimeClaude, color: "#f97316" },
+  { name: "Claude Code", collect: collectClaude, collectTime: collectTimeClaude, collectCost: collectCostClaude, color: "#f97316" },
   { name: "Codex", collect: collectCodex, collectTime: collectTimeCodex, color: "#22c55e" },
   { name: "OpenCode", collect: collectOpenCode, collectTime: collectTimeOpenCode, collectCost: collectCostOpenCode, color: "#3b82f6" },
   { name: "Gemini CLI", collect: collectGemini, collectTime: collectTimeGemini, color: "#eab308" },

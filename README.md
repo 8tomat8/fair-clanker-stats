@@ -33,7 +33,7 @@ node cli.js
 
 | Tool | Data source | `--cost` |
 |------|------------|:---:|
-| Claude Code | `~/.claude/projects/` | — |
+| Claude Code | `~/.claude/projects/` | ✓* |
 | Codex | `~/.codex/sessions/` | — |
 | OpenCode | `~/.local/share/opencode/` (SQLite + JSON) | ✓ |
 | Gemini CLI | `~/.gemini/tmp/` | — |
@@ -43,3 +43,5 @@ node cli.js
 | Mistral Vibe | `~/.vibe/logs/session/` | — |
 
 `--cost` shows API-billed spend as recorded by the tool itself; subscription-covered usage records $0.
+
+\* Claude Code writes no cost to disk, so it is computed from token counts using a vendored Anthropic price table (TTL-aware cache-write rates, as `ccusage` does). Pi / Oh My Pi 1h-TTL cache writes are re-billed at the correct 2x-input rate to fix upstream underreporting.
