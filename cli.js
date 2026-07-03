@@ -7,7 +7,9 @@ import { homedir } from "node:os"
 import { join, basename } from "node:path"
 import { execFileSync } from "node:child_process"
 import fg from "fast-glob"
-import { Resvg } from "@resvg/resvg-js"
+import { Chart } from "chart.js/auto"
+import "chartjs-adapter-date-fns"
+import { createCanvas, GlobalFonts } from "@napi-rs/canvas"
 
 let Database = null
 try {
@@ -585,21 +587,6 @@ const tools = [
   { name: "Mistral Vibe", collect: collectVibe, collectTime: collectTimeVibe, color: "#6366f1" },
 ]
 
-function catmullRomPath(points, tension = 0.3, yFloor) {
-  if (points.length < 2) return ""
-  const clampY = (y) => yFloor !== undefined ? Math.min(y, yFloor) : y
-  let d = `M${points[0].x},${points[0].y}`
-  for (let i = 0; i < points.length - 1; i++) {
-    const p0 = points[Math.max(0, i - 1)]
-    const p1 = points[i]
-    const p2 = points[i + 1]
-    const p3 = points[Math.min(points.length - 1, i + 2)]
-    const cp1y = clampY(p1.y + (p2.y - p0.y) * tension / 3)
-    const cp2y = clampY(p2.y - (p3.y - p1.y) * tension / 3)
-    d += ` C${p1.x + (p2.x - p0.x) * tension / 3},${cp1y} ${p2.x - (p3.x - p1.x) * tension / 3},${cp2y} ${p2.x},${p2.y}`
-  }
-  return d
-}
 
 function formatTotal(n) {
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1).replace(/\.0$/, "") + "B"
@@ -621,136 +608,124 @@ function formatMoney(n) {
   return "$" + n.toFixed(2).replace(/\.00$/, "")
 }
 
-const resvgFontOpts = { loadSystemFonts: true }
-
-function canRenderDot(fontFamily) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><text x="0" y="15" fill="white" font-size="15" font-family="${fontFamily}">.</text></svg>`
-  const { pixels } = new Resvg(svg, { font: resvgFontOpts }).render()
-  for (let i = 3; i < pixels.length; i += 4) if (pixels[i] > 0) return true
-  return false
-}
-
 function pickFont(candidates) {
-  for (const f of candidates) if (canRenderDot(f)) return f
-  return candidates[candidates.length - 1]
+  const have = new Set(GlobalFonts.families.map(f => f.family.toLowerCase()))
+  for (const f of candidates) if (have.has(f.toLowerCase())) return f
+  return "sans-serif"
 }
 
 function renderChart(allDays, results, total, { unit = "TOKENS", cmd = "npx fair-clanker-stats --share", formatVal = formatTotal } = {}) {
-  const W = 1500, H = 560
-  const pad = { top: 130, right: 50, bottom: 60, left: 50 }
-  const chartW = W - pad.left - pad.right
-  const chartH = H - pad.top - pad.bottom
-  const font = pickFont(['Berkeley Mono', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Noto Sans', 'sans-serif'])
-  const mono = pickFont(['Berkeley Mono', 'SF Mono', 'Fira Code', 'Noto Sans Mono', 'monospace'])
-
-  const numWeeks = Math.ceil(allDays.length / 7)
-  const toolWeekly = results.map(r => {
-    const weeks = []
-    for (let i = 0; i < allDays.length; i += 7) {
-      let sum = 0
-      for (let j = i; j < Math.min(i + 7, allDays.length); j++) sum += r.counts.get(allDays[j]) || 0
-      weeks.push(sum)
-    }
-    return weeks
-  })
-
-  const stacked = []
-  for (let t = 0; t < results.length; t++) {
-    stacked.push(Array.from({ length: numWeeks }, (_, w) => {
-      let sum = 0
-      for (let ti = 0; ti <= t; ti++) sum += toolWeekly[ti][w]
-      return sum
-    }))
-  }
-
-  const maxY = (Math.max(...stacked[stacked.length - 1]) || 1) * 1.08
-
-  const toX = (w) => pad.left + (w / (numWeeks - 1)) * chartW
-  const toY = (val) => pad.top + chartH - (val / maxY) * chartH
-  const baseline = pad.top + chartH
-
-  let areas = ""
-  for (let t = results.length - 1; t >= 0; t--) {
-    const topPoints = Array.from({ length: numWeeks }, (_, w) => ({ x: toX(w), y: toY(stacked[t][w]) }))
-    const botPoints = t === 0
-      ? [{ x: toX(0), y: baseline }, { x: toX(numWeeks - 1), y: baseline }]
-      : Array.from({ length: numWeeks }, (_, w) => ({ x: toX(w), y: toY(stacked[t - 1][w]) }))
-
-    const topPath = catmullRomPath(topPoints, 0.3, baseline)
-    const botReversed = [...botPoints].reverse()
-    const botPath = t === 0
-      ? `L${toX(numWeeks - 1)},${baseline} L${toX(0)},${baseline}`
-      : catmullRomPath(botReversed, 0.3, baseline).replace("M", "L")
-
-    areas += `<path d="${topPath} ${botPath} Z" fill="${results[t].color}" opacity="0.55" clip-path="url(#chart-clip)"/>\n`
-  }
-
-  const totalPoints = Array.from({ length: numWeeks }, (_, w) => ({ x: toX(w), y: toY(stacked[stacked.length - 1][w]) }))
-  const totalPath = catmullRomPath(totalPoints, 0.3, baseline)
-
-  const gridCount = 4
-  let gridLines = ""
-  for (let i = 1; i <= gridCount; i++) {
-    const val = (maxY / gridCount) * i
-    const y = pad.top + chartH - (i / gridCount) * chartH
-    gridLines += `<line x1="${pad.left}" y1="${y}" x2="${pad.left + chartW}" y2="${y}" stroke="#21262d" stroke-width="1"/>\n`
-    gridLines += `<text x="${pad.left + chartW + 8}" y="${y + 4}" fill="#3b434b" font-family="${font}" font-size="11">${formatVal(val)}</text>\n`
-  }
-
-  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-  let labels = ""
-  const seenLabels = new Set()
-  const startDate = new Date(allDays[0] + "T00:00:00")
-  const endDate = new Date(allDays[allDays.length - 1] + "T00:00:00")
-  let cursor = new Date(startDate.getFullYear(), startDate.getMonth(), 1)
-  while (cursor <= endDate) {
-    const iso = cursor.toISOString().slice(0, 10)
-    const dayIndex = allDays.indexOf(iso)
-    const effectiveIndex = dayIndex >= 0 ? dayIndex : allDays.findIndex(d => d >= iso)
-    if (effectiveIndex >= 0) {
-      const x = pad.left + (effectiveIndex / (allDays.length - 1)) * chartW
-      const label = `${monthNames[cursor.getMonth()]} '${String(cursor.getFullYear()).slice(2)}`
-      if (!seenLabels.has(label) && x >= pad.left + 20 && x <= pad.left + chartW - 20) {
-        seenLabels.add(label)
-        labels += `<text x="${x}" y="${H - 18}" text-anchor="middle" fill="#484f58" font-family="${font}" font-size="13">${label}</text>\n`
-      }
-    }
-    cursor.setMonth(cursor.getMonth() + 1)
-  }
+  const W = 1500, H = 640
+  const font = pickFont(["Berkeley Mono", "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono"])
+  Chart.defaults.font.family = font
+  Chart.defaults.color = "#8b949e"
 
   const visible = results.filter(r => [...r.counts.values()].reduce((a, b) => a + b, 0) > 0)
-  const legendItemW = 145
-  const legendStartX = pad.left + 8
-  const legendEndX = legendStartX + visible.length * legendItemW
-  const totalStartX = W - pad.right - 160
-  const midX = (legendEndX + totalStartX) / 2 - 30
-  const vcenter = pad.top / 2
-  let legend = ""
-  for (let i = 0; i < visible.length; i++) {
-    const x = legendStartX + i * legendItemW
-    const count = [...visible[i].counts.values()].reduce((a, b) => a + b, 0)
-    legend += `<rect x="${x}" y="${vcenter - 14}" width="14" height="14" rx="3" fill="${visible[i].color}" opacity="0.8"/>`
-    legend += `<text x="${x + 20}" y="${vcenter}" fill="#8b949e" font-family="${font}" font-size="18">${visible[i].name}</text>`
-    legend += `<text x="${x + 20}" y="${vcenter + 20}" fill="#8b949e" font-family="${font}" font-size="17">${formatVal(count)}</text>\n`
+
+  const datasets = visible.map(r => {
+    const totalStr = formatVal([...r.counts.values()].reduce((a, b) => a + b, 0))
+    return {
+      label: `${r.name}  ${totalStr}`,
+      data: allDays.map(d => ({ x: d, y: r.counts.get(d) || 0 })),
+      backgroundColor: r.color,
+      borderWidth: 0,
+      barPercentage: 1,
+      categoryPercentage: 1,
+    }
+  })
+
+  const canvas = createCanvas(W, H)
+  const bg = {
+    id: "bg",
+    beforeDraw: (c) => {
+      const { ctx } = c
+      ctx.save()
+      ctx.fillStyle = "#0d1117"
+      ctx.fillRect(0, 0, W, H)
+      ctx.restore()
+    },
+  }
+  const header = {
+    id: "header",
+    afterDraw: (c) => {
+      const { ctx } = c
+      ctx.save()
+      // big total, right-aligned
+      ctx.textAlign = "right"
+      ctx.fillStyle = "#f0f6fc"
+      ctx.font = `800 44px ${font}`
+      ctx.fillText(formatVal(total), W - 44, 56)
+      ctx.fillStyle = "#484f58"
+      ctx.font = `600 15px ${font}`
+      ctx.fillText(unit, W - 44, 80)
+      // cmd pill, top center (header row, clear of axis labels)
+      const pillW = Math.round(cmd.length * 11.5) + 44
+      const pillX = (W - pillW) / 2
+      ctx.fillStyle = "#161b22"
+      ctx.beginPath()
+      ctx.roundRect(pillX, 20, pillW, 34, 8)
+      ctx.fill()
+      ctx.fillStyle = "#8b949e"
+      ctx.textAlign = "center"
+      ctx.font = `19px ${font}`
+      ctx.fillText(cmd, W / 2, 43)
+      ctx.restore()
+    },
   }
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
-<defs>
-  <clipPath id="chart-clip">
-    <rect x="${pad.left}" y="${pad.top - 4}" width="${chartW}" height="${chartH + 8}"/>
-  </clipPath>
-</defs>
-<rect width="${W}" height="${H}" fill="#0d1117"/>
-<text x="${W - pad.right}" y="${vcenter + 6}" text-anchor="end" fill="#f0f6fc" font-family="${font}" font-size="48" font-weight="800">${formatVal(total)}</text>
-<text x="${W - pad.right}" y="${vcenter + 26}" text-anchor="end" fill="#484f58" font-family="${font}" font-size="16" letter-spacing="2" font-weight="600">${unit}</text>
-<rect x="${midX - 170}" y="${vcenter - 20}" width="340" height="40" rx="8" fill="#161b22"/>
-<text x="${midX}" y="${vcenter + 5}" text-anchor="middle" fill="#8b949e" font-family="${mono}" font-size="22">${cmd}</text>
-${legend}
-${gridLines}
-${areas}
-<path d="${totalPath}" fill="none" stroke="#e6edf3" stroke-width="1.5" stroke-opacity="0.4" stroke-linejoin="round" stroke-linecap="round" clip-path="url(#chart-clip)"/>
-${labels}
-</svg>`
+  const chart = new Chart(canvas, {
+    type: "bar",
+    data: { datasets },
+    plugins: [bg, header],
+    options: {
+      animation: false,
+      responsive: false,
+      devicePixelRatio: 2,
+      layout: { padding: { top: 64, bottom: 8, left: 24, right: 30 } },
+      scales: {
+        x: {
+          type: "time",
+          stacked: true,
+          time: { unit: "week", isoWeekday: true, displayFormats: { week: "d MMM" } },
+          grid: { color: "#161b22", tickLength: 0, offset: false },
+          border: { display: false },
+          ticks: {
+            color: "#484f58", font: { size: 12 }, maxRotation: 0, autoSkip: false, padding: 10,
+            callback: (v, i) => {
+              const d = new Date(v)
+              const label = `${d.getDate()} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()]}`
+              return i % 2 === 0 ? label : "" // every gridline weekly, label biweekly
+            },
+          },
+        },
+        y: {
+          stacked: true,
+          position: "right",
+          beginAtZero: true,
+          grid: { color: "#21262d", tickLength: 0 },
+          border: { display: false },
+          ticks: { color: "#3b434b", font: { size: 12 }, maxTicksLimit: 6, padding: 8, callback: (v) => v === 0 ? "" : formatVal(v) },
+        },
+      },
+      plugins: {
+        legend: {
+          position: "top",
+          align: "start",
+          labels: {
+            color: "#8b949e",
+            boxWidth: 14, boxHeight: 14, borderRadius: 3, useBorderRadius: true,
+            font: { size: 15 },
+            padding: 16,
+          },
+        },
+        tooltip: { enabled: false },
+      },
+    },
+  })
+
+  const png = canvas.toBuffer("image/png")
+  chart.destroy()
+  return png
 }
 
 function openPath(target) {
@@ -818,9 +793,7 @@ async function main() {
     : share ? {} : { cmd: "npx fair-clanker-stats" }
   console.log(`\n${allDays.length} days, ${cost || hours ? fmt(total) : formatTotal(total) + " total tokens"}`)
 
-  const svg = renderChart(allDays, results, total, chartOpts)
-  const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1500 }, font: resvgFontOpts })
-  const png = resvg.render().asPng()
+  const png = renderChart(allDays, results, total, chartOpts)
 
   const outPath = join(process.cwd(), "chart.png")
   await writeFile(outPath, png)
